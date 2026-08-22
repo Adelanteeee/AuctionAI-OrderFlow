@@ -57,7 +57,7 @@ string activeSession = sessionPreset == "Asia" ? "0000-0900" : sessionPreset == 
 bool inSession = not na(time(timeframe.period, activeSession))
 bool sessionStart = inSession and not inSession[1]
 
-[array<float> ltfOpen, array<float> ltfClose, array<float> ltfVolume] = request.security_lower_tf(syminfo.tickerid, lowerTf, [open, close, volume])
+[ltfOpen, ltfClose, ltfVolume] = request.security_lower_tf(syminfo.tickerid, lowerTf, [open, close, volume])
 float buyVolume = 0.0
 float sellVolume = 0.0
 float neutralVolume = 0.0
