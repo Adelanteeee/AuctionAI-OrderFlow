@@ -1,6 +1,14 @@
+import math
 import pandas as pd
 
 METRIC_COLS=['dir_return_1','dir_return_3','dir_return_5','mfe_atr','mae_atr']
+
+def _safe_stat(series, kind):
+    clean=series.dropna()
+    if clean.empty:
+        return math.nan
+    return float(clean.mean() if kind=='mean' else clean.median())
+
 
 def _aggregate(g, min_samples, group_type, group_value, event_type):
     n=len(g); vc=g['label'].value_counts()
@@ -9,9 +17,9 @@ def _aggregate(g, min_samples, group_type, group_value, event_type):
         'valid_count':int(vc.get('VALID',0)),'valid_rate':float(vc.get('VALID',0)/n),
         'failed_count':int(vc.get('FAILED',0)),'failed_rate':float(vc.get('FAILED',0)/n),
         'neutral_count':int(vc.get('NEUTRAL',0)),'neutral_rate':float(vc.get('NEUTRAL',0)/n),
-        'avg_dir_return_1':g['dir_return_1'].mean(),'avg_dir_return_3':g['dir_return_3'].mean(),'avg_dir_return_5':g['dir_return_5'].mean(),
-        'median_dir_return_1':g['dir_return_1'].median(),'median_dir_return_3':g['dir_return_3'].median(),'median_dir_return_5':g['dir_return_5'].median(),
-        'avg_mfe_atr':g['mfe_atr'].mean(),'avg_mae_atr':g['mae_atr'].mean(),
+        'avg_dir_return_1':_safe_stat(g['dir_return_1'],'mean'),'avg_dir_return_3':_safe_stat(g['dir_return_3'],'mean'),'avg_dir_return_5':_safe_stat(g['dir_return_5'],'mean'),
+        'median_dir_return_1':_safe_stat(g['dir_return_1'],'median'),'median_dir_return_3':_safe_stat(g['dir_return_3'],'median'),'median_dir_return_5':_safe_stat(g['dir_return_5'],'median'),
+        'avg_mfe_atr':_safe_stat(g['mfe_atr'],'mean'),'avg_mae_atr':_safe_stat(g['mae_atr'],'mean'),
         'sample_quality':'OK' if n>=min_samples else 'LOW_SAMPLE'}
 
 def summarize_events(events: pd.DataFrame, min_samples: int=10) -> pd.DataFrame:
