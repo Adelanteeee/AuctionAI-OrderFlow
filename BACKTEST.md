@@ -21,8 +21,11 @@ python -m backtest.cli \
   --timeframe 15min \
   --source-timezone UTC \
   --session NewYork \
+  --auction-reference PreviousDay \
   --output-dir output/xauusd_15m
 ```
+
+Auction reference choices are `PreviousDay` and `PreviousSession`.
 
 Outputs:
 
@@ -37,6 +40,8 @@ Default research label over the next five parent bars:
 - `VALID`: directional MFE reaches +0.5 ATR before adverse excursion reaches 0.5 ATR.
 - `FAILED`: adverse excursion reaches 0.5 ATR first.
 - `NEUTRAL`: neither threshold is reached.
+
+MFE and MAE themselves are measured across the full five-bar evaluation window, even after the validity label is determined.
 
 This is an event-quality test, not an entry/SL/TP trading rule.
 
