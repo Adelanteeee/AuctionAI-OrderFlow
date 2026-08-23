@@ -12,6 +12,7 @@ def build_parser():
     p.add_argument('--timeframe',default='15min')
     p.add_argument('--source-timezone',default='UTC')
     p.add_argument('--session',default='NewYork',choices=['NewYork','London','Asia'])
+    p.add_argument('--auction-reference',default='PreviousDay',choices=['PreviousDay','PreviousSession'])
     p.add_argument('--output-dir',required=True)
     return p
 
@@ -19,7 +20,7 @@ def build_parser():
 def main(argv=None):
     args=build_parser().parse_args(argv)
     df=load_csv(args.csv,args.source_timezone)
-    cfg=BacktestConfig(parent_timeframe=args.timeframe, session_name=args.session)
+    cfg=BacktestConfig(parent_timeframe=args.timeframe, session_name=args.session, auction_reference=args.auction_reference)
     events,summary,bars=run_backtest(df,cfg,symbol=args.symbol)
     out=Path(args.output_dir); out.mkdir(parents=True,exist_ok=True)
     events.to_csv(out/'events.csv',index=False)
