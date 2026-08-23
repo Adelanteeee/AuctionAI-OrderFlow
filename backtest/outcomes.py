@@ -9,6 +9,9 @@ def evaluate_event(*, entry_close, atr, direction, future, threshold_atr=.5):
         fav = (row.high-entry_close) if bullish else (entry_close-row.low)
         adv = (entry_close-row.low) if bullish else (row.high-entry_close)
         mfe=max(mfe,fav); mae=max(mae,adv)
-        if fav>=threshold and label=='NEUTRAL': label='VALID'; break
-        if adv>=threshold and label=='NEUTRAL': label='FAILED'; break
+        if label == 'NEUTRAL':
+            if fav>=threshold:
+                label='VALID'
+            elif adv>=threshold:
+                label='FAILED'
     return {'label':label,'mfe_atr':mfe/atr,'mae_atr':mae/atr}
