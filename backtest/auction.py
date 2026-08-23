@@ -15,11 +15,15 @@ class AuctionTracker:
         self.accepted_above = False
         self.accepted_below = False
         self.prev_close = None
+        self.rejected_above_latched = False
+        self.rejected_below_latched = False
 
     def reset(self):
         self.above_count = self.below_count = 0
         self.accepted_above = self.accepted_below = False
         self.prev_close = None
+        self.rejected_above_latched = False
+        self.rejected_below_latched = False
 
     def update(self, *, close, high, low, ref_poc, ref_vah, ref_val, atr):
         if any(x is None for x in (ref_poc, ref_vah, ref_val)):
@@ -36,10 +40,20 @@ class AuctionTracker:
         else:
             self.above_count = self.below_count = 0
             self.accepted_above = self.accepted_below = False
+        if close > ref_vah:
+            self.rejected_above_latched = False
+        if close < ref_val:
+            self.rejected_below_latched = False
         if rejected_above:
-            event = 'REJ_ABOVE_VAH'; self.accepted_above = False
+            if not self.rejected_above_latched:
+                event = 'REJ_ABOVE_VAH'
+                self.rejected_above_latched = True
+            self.accepted_above = False
         elif rejected_below:
-            event = 'REJ_BELOW_VAL'; self.accepted_below = False
+            if not self.rejected_below_latched:
+                event = 'REJ_BELOW_VAL'
+                self.rejected_below_latched = True
+            self.accepted_below = False
         elif self.above_count >= self.acceptance_closes and not self.accepted_above:
             self.accepted_above = True; self.accepted_below = False; event = 'ACC_ABOVE_VAH'
         elif self.below_count >= self.acceptance_closes and not self.accepted_below:
