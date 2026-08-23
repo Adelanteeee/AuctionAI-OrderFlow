@@ -25,3 +25,4 @@ class BacktestConfig:
     outcome_threshold_atr: float = 0.5
     outcome_horizon: int = 5
     session_name: str = 'NewYork'
+    auction_reference: str = 'PreviousDay'
