@@ -1,3 +1,4 @@
+import math
 import pandas as pd
 from backtest.config import BacktestConfig
 from backtest.divergence import confirmed_divergence_events
@@ -34,3 +35,30 @@ def test_summary_marks_low_samples():
     ev = pd.DataFrame([{'event_type':'X','label':'VALID','dir_return_1':.1,'dir_return_3':.2,'dir_return_5':.3,'mfe_atr':.7,'mae_atr':.2},{'event_type':'X','label':'FAILED','dir_return_1':-.1,'dir_return_3':-.2,'dir_return_5':-.3,'mfe_atr':.2,'mae_atr':.7}])
     s = summarize_events(ev, min_samples=5)
     assert s.iloc[0].sample_quality == 'LOW_SAMPLE'
+
+
+def test_absorption_event_is_transition_only(monkeypatch):
+    import backtest.runner as runner_mod
+    idx = pd.date_range('2026-01-01', periods=60, freq='1min', tz='UTC')
+    p = pd.Series(100.0, index=idx)
+    df = pd.DataFrame({'open':p,'high':p+.5,'low':p-.5,'close':p+.1,'volume':100.0}, index=idx)
+    monkeypatch.setattr(runner_mod, 'absorption_score', lambda **kwargs: (80.0, 'SELLING ABSORBED', 'STRONG SELLING ABSORPTION'))
+    events, _, _ = runner_mod.run_backtest(df, BacktestConfig(parent_timeframe='15min'), symbol='SYNTH')
+    strong = events[events.event_type=='STRONG_SELLING_ABSORPTION']
+    assert len(strong) == 1
+
+
+def test_python_auction_reference_can_use_previous_session():
+    idx = pd.date_range('2026-01-01', periods=3*24*60, freq='1min', tz='UTC')
+    p = pd.Series(100.0, index=idx)
+    for i, ts in enumerate(idx):
+        local=ts.tz_convert('America/New_York')
+        if local.date().isoformat()=='2026-01-02' and (local.hour*60+local.minute)>=570 and (local.hour*60+local.minute)<960:
+            p.iloc[i]=120.0
+    df=pd.DataFrame({'open':p,'high':p+.4,'low':p-.4,'close':p+.1,'volume':100.0},index=idx)
+    cfg=BacktestConfig(parent_timeframe='15min',session_name='NewYork',auction_reference='PreviousSession')
+    _,_,bars=run_backtest(df,cfg,symbol='SYNTH')
+    jan3_session=bars[(bars.index.tz_convert('America/New_York').date.astype(str)=='2026-01-03') & bars.in_session]
+    first=jan3_session.iloc[0]
+    assert math.isclose(first.ref_poc, first.prev_session_poc, rel_tol=1e-9)
+    assert not math.isclose(first.ref_poc, bars.loc[jan3_session.index[0], 'prev_day_poc'], rel_tol=1e-6)
