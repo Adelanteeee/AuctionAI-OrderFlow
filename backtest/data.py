@@ -1,3 +1,4 @@
+import warnings
 import pandas as pd
 
 OHLCV = ['open','high','low','close','volume']
@@ -16,6 +17,7 @@ def load_csv(path: str, source_timezone: str = 'UTC') -> pd.DataFrame:
     out.index = ts
     out = out.sort_index()
     if out.index.has_duplicates:
+        warnings.warn('Duplicate timestamp rows found; keeping the last row for each duplicate timestamp.', RuntimeWarning, stacklevel=2)
         out = out[~out.index.duplicated(keep='last')]
     return out.astype(float)
 
