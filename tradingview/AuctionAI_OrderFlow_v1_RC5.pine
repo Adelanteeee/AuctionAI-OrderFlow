@@ -1,0 +1,400 @@
+//@version=6
+indicator("AuctionAI Order Flow v1 — RC5 Universal", overlay=true, max_boxes_count=300, max_lines_count=100, max_labels_count=300)
+
+// ---------- Groups ----------
+string G_DELTA = "Delta"
+string G_CVD = "CVD"
+string G_VOLUME = "Volume"
+string G_EVR = "Effort vs Result"
+string G_ABS = "Absorption"
+string G_DIV = "Divergence"
+string G_COLOR = "Candle Coloring"
+string G_PROFILE = "Volume Profile"
+string G_SESSION = "Sessions"
+string G_DISPLAY = "Display"
+string G_DIAG = "Diagnostics"
+
+// ---------- Inputs ----------
+lowerTf = input.timeframe("1", "Lower Timeframe", group=G_DELTA)
+deltaStrongPct = input.float(20.0, "Strong |Delta %|", minval=0.0, step=1.0, group=G_DELTA)
+deltaBodyWeight = input.float(0.65, "Body Direction Weight", minval=0.0, maxval=1.0, step=0.05, group=G_DELTA)
+deltaCloseWeight = input.float(0.35, "Close Location Weight", minval=0.0, maxval=1.0, step=0.05, group=G_DELTA)
+deltaPressureCap = input.float(0.90, "Intrabar Pressure Cap", minval=0.50, maxval=1.0, step=0.05, group=G_DELTA, tooltip="Caps the directional share assigned to one intrabar so estimated Delta does not become artificially +/-100% too easily.")
+minDeltaCoverage = input.float(0.70, "Minimum Delta Coverage", minval=0.10, maxval=1.0, step=0.05, group=G_DELTA)
+
+cvdResetMode = input.string("Continuous", "CVD Reset", options=["Continuous", "Daily", "Session"], group=G_CVD)
+cvdSmoothLen = input.int(5, "CVD Smoothing", minval=1, group=G_CVD)
+
+volumeLen = input.int(20, "Volume Average Length", minval=2, group=G_VOLUME)
+highVolMult = input.float(1.5, "High Volume Multiplier", minval=1.0, step=0.1, group=G_VOLUME)
+extremeVolMult = input.float(2.5, "Extreme Volume Multiplier", minval=1.1, step=0.1, group=G_VOLUME)
+showPeriodVolumeStats = input.bool(true, "Show Daily / Session Volume Stats", group=G_VOLUME)
+
+atrLen = input.int(14, "ATR Length", minval=1, group=G_EVR)
+resultThreshold = input.float(0.5, "High Result / ATR", minval=0.05, step=0.05, group=G_EVR)
+
+absDeltaPct = input.float(20.0, "Min |Delta %|", minval=0.0, step=1.0, group=G_ABS)
+wickRatioMin = input.float(0.35, "Min Rejection Wick / Range", minval=0.0, maxval=1.0, step=0.05, group=G_ABS)
+
+pivotLeft = input.int(3, "Pivot Left", minval=1, group=G_DIV)
+pivotRight = input.int(3, "Pivot Right", minval=1, group=G_DIV)
+showDivMarkers = input.bool(true, "Show Strong Divergence", group=G_DIV)
+showWeakDiv = input.bool(false, "Show Weak Divergence", group=G_DIV)
+
+colorCandles = input.bool(true, "Enable Candle Coloring", group=G_COLOR)
+buyColor = input.color(color.lime, "Strong Buying", group=G_COLOR)
+sellColor = input.color(color.red, "Strong Selling", group=G_COLOR)
+sellAbsColor = input.color(color.aqua, "Selling Absorbed", group=G_COLOR)
+buyAbsColor = input.color(color.fuchsia, "Buying Absorbed", group=G_COLOR)
+bullDivColor = input.color(color.teal, "Bullish Divergence", group=G_COLOR)
+bearDivColor = input.color(color.orange, "Bearish Divergence", group=G_COLOR)
+noResultColor = input.color(color.yellow, "High Effort / Low Result", group=G_COLOR)
+
+profileMode = input.string("Daily", "Profile Mode", options=["Off", "Daily", "Session"], group=G_PROFILE)
+profileDisplay = input.string("Levels Only", "Display", options=["Levels Only", "Full Profile"], group=G_PROFILE)
+profileRows = input.int(28, "Rows", minval=8, maxval=60, group=G_PROFILE)
+valueAreaPct = input.float(70.0, "Value Area %", minval=50.0, maxval=99.0, step=1.0, group=G_PROFILE)
+profileWidthBars = input.int(24, "Histogram Width", minval=5, maxval=50, group=G_PROFILE)
+profileMaxIntrabars = input.int(3000, "Max Stored Intrabars", minval=500, maxval=6000, step=250, group=G_PROFILE)
+showDevelopingProfile = input.bool(false, "Include Current Partial Bar", group=G_PROFILE)
+
+sessionPreset = input.string("New York", "Session", options=["Asia", "London", "New York", "Custom"], group=G_SESSION)
+customSession = input.session("0930-1600", "Custom Session", group=G_SESSION)
+customTimezone = input.string("Etc/UTC", "Custom Time Zone", group=G_SESSION)
+
+showAbsMarkers = input.bool(true, "Show Absorption Markers", group=G_DISPLAY)
+showDiagnostics = input.bool(true, "Show Diagnostics", group=G_DIAG)
+
+// ---------- Session Engine ----------
+string presetSession = sessionPreset == "Asia" ? "0900-1800" : sessionPreset == "London" ? "0800-1700" : sessionPreset == "New York" ? "0930-1600" : customSession
+string presetTimezone = sessionPreset == "Asia" ? "Asia/Tokyo" : sessionPreset == "London" ? "Europe/London" : sessionPreset == "New York" ? "America/New_York" : customTimezone
+bool inSession = not na(time(timeframe.period, presetSession, presetTimezone))
+bool sessionStart = inSession and not inSession[1]
+bool newDay = timeframe.change("D")
+bool confirmedSignalBar = barstate.isconfirmed
+string barStatus = not barstate.isconfirmed ? "LIVE / PARTIAL" : "CLOSED"
+
+// ---------- Intrabar Delta v2 ----------
+[ltfOpen, ltfHigh, ltfLow, ltfClose, ltfVolume] = request.security_lower_tf(syminfo.tickerid, lowerTf, [open, high, low, close, volume])
+int intrabarCount = array.size(ltfVolume)
+
+float buyVolume = 0.0
+float sellVolume = 0.0
+float classifiedVolume = 0.0
+float weightSum = math.max(deltaBodyWeight + deltaCloseWeight, 0.0001)
+
+if intrabarCount > 0
+    for i = 0 to intrabarCount - 1
+        float o = array.get(ltfOpen, i)
+        float h = array.get(ltfHigh, i)
+        float l = array.get(ltfLow, i)
+        float c = array.get(ltfClose, i)
+        float v = nz(array.get(ltfVolume, i))
+        float r = math.max(h - l, syminfo.mintick)
+        float bodyBias = math.max(-1.0, math.min(1.0, (c - o) / r))
+        float closeBias = math.max(-1.0, math.min(1.0, ((c - l) / r) * 2.0 - 1.0))
+        float pressureRaw = (bodyBias * deltaBodyWeight + closeBias * deltaCloseWeight) / weightSum
+        float pressure = math.max(-deltaPressureCap, math.min(deltaPressureCap, pressureRaw))
+        float buyShare = 0.5 + 0.5 * pressure
+        float sellShare = 1.0 - buyShare
+        buyVolume += v * buyShare
+        sellVolume += v * sellShare
+        classifiedVolume += v
+
+float delta = intrabarCount > 0 ? buyVolume - sellVolume : na
+float deltaPercent = classifiedVolume > 0 and not na(delta) ? delta / classifiedVolume * 100.0 : na
+float deltaCoverage = volume > 0 ? math.min(1.0, classifiedVolume / volume) : na
+bool deltaReliable = intrabarCount > 0 and not na(deltaCoverage) and deltaCoverage >= minDeltaCoverage
+
+// ---------- Volume Engine + Daily / Session Volume ----------
+float volumeAvg = ta.sma(volume, volumeLen)
+float relativeVolume = volumeAvg > 0 ? volume / volumeAvg : na
+bool highEffort = not na(relativeVolume) and relativeVolume >= highVolMult
+string volumeState = na(relativeVolume) ? "N/A" : relativeVolume >= extremeVolMult ? "EXTREME" : relativeVolume >= highVolMult ? "HIGH" : "NORMAL"
+
+var float dailyVolume = 0.0
+var float previousDailyVolume = na
+if newDay
+    previousDailyVolume := dailyVolume
+    dailyVolume := volume
+else
+    dailyVolume += volume
+
+var float sessionVolume = 0.0
+var float previousSessionVolume = na
+if sessionStart
+    previousSessionVolume := sessionVolume
+    sessionVolume := volume
+else if inSession
+    sessionVolume += volume
+
+float dailyVsPrevPct = not na(previousDailyVolume) and previousDailyVolume > 0 ? dailyVolume / previousDailyVolume * 100.0 : na
+float sessionVsPrevPct = not na(previousSessionVolume) and previousSessionVolume > 0 ? sessionVolume / previousSessionVolume * 100.0 : na
+
+// ---------- CVD ----------
+bool resetDaily = cvdResetMode == "Daily" and newDay
+bool resetSession = cvdResetMode == "Session" and sessionStart
+var float cvd = 0.0
+cvd := resetDaily or resetSession ? nz(delta) : cvd + nz(delta)
+float cvdSmooth = ta.ema(cvd, cvdSmoothLen)
+float cvdSlope = cvdSmooth - cvdSmooth[1]
+string cvdBias = cvdSlope > 0 ? "RISING" : cvdSlope < 0 ? "FALLING" : "FLAT"
+
+// ---------- Effort vs Result ----------
+float atr = ta.atr(atrLen)
+float resultMagnitude = math.abs(close - close[1])
+bool highResult = atr > 0 and resultMagnitude >= atr * resultThreshold
+string effortResultState = highEffort and highResult ? "HIGH EFFORT / HIGH RESULT" : highEffort ? "HIGH EFFORT / LOW RESULT" : highResult ? "LOW EFFORT / HIGH RESULT" : "LOW EFFORT / LOW RESULT"
+
+// ---------- Absorption ----------
+float barRange = math.max(high - low, syminfo.mintick)
+float upperWickRatio = (high - math.max(open, close)) / barRange
+float lowerWickRatio = (math.min(open, close) - low) / barRange
+float closeLocation = (close - low) / barRange
+bool sellPressure = deltaReliable and not na(deltaPercent) and deltaPercent <= -absDeltaPct
+bool buyPressure = deltaReliable and not na(deltaPercent) and deltaPercent >= absDeltaPct
+bool possibleSellingAbsorption = sellPressure and highEffort and not highResult and (lowerWickRatio >= wickRatioMin or closeLocation >= 0.55)
+bool possibleBuyingAbsorption = buyPressure and highEffort and not highResult and (upperWickRatio >= wickRatioMin or closeLocation <= 0.45)
+bool strongSellingAbsorption = confirmedSignalBar and possibleSellingAbsorption and lowerWickRatio >= wickRatioMin and closeLocation >= 0.60
+bool strongBuyingAbsorption = confirmedSignalBar and possibleBuyingAbsorption and upperWickRatio >= wickRatioMin and closeLocation <= 0.40
+string absorptionState = strongSellingAbsorption ? "STRONG SELLING ABSORPTION" : strongBuyingAbsorption ? "STRONG BUYING ABSORPTION" : possibleSellingAbsorption ? "POSSIBLE SELLING ABSORPTION" : possibleBuyingAbsorption ? "POSSIBLE BUYING ABSORPTION" : "NO ABSORPTION"
+
+// ---------- Divergence ----------
+float lowPivot = ta.pivotlow(low, pivotLeft, pivotRight)
+float highPivot = ta.pivothigh(high, pivotLeft, pivotRight)
+bool newLowPivot = not na(lowPivot)
+bool newHighPivot = not na(highPivot)
+var float prevLowPrice = na
+var float prevLowDelta = na
+var float prevLowCvd = na
+var float prevHighPrice = na
+var float prevHighDelta = na
+var float prevHighCvd = na
+float currLowPrice = newLowPivot ? low[pivotRight] : na
+float currLowDelta = newLowPivot ? delta[pivotRight] : na
+float currLowCvd = newLowPivot ? cvd[pivotRight] : na
+float currHighPrice = newHighPivot ? high[pivotRight] : na
+float currHighDelta = newHighPivot ? delta[pivotRight] : na
+float currHighCvd = newHighPivot ? cvd[pivotRight] : na
+bool bullDeltaDiv = newLowPivot and not na(prevLowPrice) and not na(currLowDelta) and not na(prevLowDelta) and currLowPrice < prevLowPrice and currLowDelta > prevLowDelta
+bool bullCvdDiv = newLowPivot and not na(prevLowPrice) and not na(currLowCvd) and not na(prevLowCvd) and currLowPrice < prevLowPrice and currLowCvd > prevLowCvd
+bool bearDeltaDiv = newHighPivot and not na(prevHighPrice) and not na(currHighDelta) and not na(prevHighDelta) and currHighPrice > prevHighPrice and currHighDelta < prevHighDelta
+bool bearCvdDiv = newHighPivot and not na(prevHighPrice) and not na(currHighCvd) and not na(prevHighCvd) and currHighPrice > prevHighPrice and currHighCvd < prevHighCvd
+bool strongBullDiv = bullDeltaDiv and bullCvdDiv
+bool strongBearDiv = bearDeltaDiv and bearCvdDiv
+bool weakBullDiv = (bullDeltaDiv or bullCvdDiv) and not strongBullDiv
+bool weakBearDiv = (bearDeltaDiv or bearCvdDiv) and not strongBearDiv
+
+plotshape(showDivMarkers and strongBullDiv and confirmedSignalBar, title="Strong Bullish Divergence", style=shape.triangleup, location=location.belowbar, offset=-pivotRight, color=bullDivColor, size=size.tiny, text="DIV+")
+plotshape(showDivMarkers and strongBearDiv and confirmedSignalBar, title="Strong Bearish Divergence", style=shape.triangledown, location=location.abovebar, offset=-pivotRight, color=bearDivColor, size=size.tiny, text="DIV+")
+plotshape(showWeakDiv and weakBullDiv and confirmedSignalBar, title="Weak Bullish Divergence", style=shape.circle, location=location.belowbar, offset=-pivotRight, color=color.new(bullDivColor, 45), size=size.tiny)
+plotshape(showWeakDiv and weakBearDiv and confirmedSignalBar, title="Weak Bearish Divergence", style=shape.circle, location=location.abovebar, offset=-pivotRight, color=color.new(bearDivColor, 45), size=size.tiny)
+
+if newLowPivot
+    prevLowPrice := currLowPrice
+    prevLowDelta := currLowDelta
+    prevLowCvd := currLowCvd
+if newHighPivot
+    prevHighPrice := currHighPrice
+    prevHighDelta := currHighDelta
+    prevHighCvd := currHighCvd
+
+// ---------- Candle State ----------
+bool strongBuying = confirmedSignalBar and deltaReliable and highEffort and not na(deltaPercent) and deltaPercent >= deltaStrongPct and close > open
+bool strongSelling = confirmedSignalBar and deltaReliable and highEffort and not na(deltaPercent) and deltaPercent <= -deltaStrongPct and close < open
+bool highEffortLowResult = confirmedSignalBar and highEffort and not highResult
+string candleState = "NEUTRAL"
+color resolvedColor = na
+if strongSellingAbsorption
+    candleState := "SELLING ABSORBED"
+    resolvedColor := sellAbsColor
+else if strongBuyingAbsorption
+    candleState := "BUYING ABSORBED"
+    resolvedColor := buyAbsColor
+else if confirmedSignalBar and strongBullDiv
+    candleState := "BULLISH DIVERGENCE"
+    resolvedColor := bullDivColor
+else if confirmedSignalBar and strongBearDiv
+    candleState := "BEARISH DIVERGENCE"
+    resolvedColor := bearDivColor
+else if strongBuying
+    candleState := "STRONG BUYING"
+    resolvedColor := buyColor
+else if strongSelling
+    candleState := "STRONG SELLING"
+    resolvedColor := sellColor
+else if highEffortLowResult
+    candleState := "HIGH EFFORT / LOW RESULT"
+    resolvedColor := noResultColor
+barcolor(colorCandles ? resolvedColor : na)
+plotshape(showAbsMarkers and strongSellingAbsorption, title="Selling Absorbed", style=shape.circle, location=location.belowbar, color=sellAbsColor, size=size.tiny, text="A")
+plotshape(showAbsMarkers and strongBuyingAbsorption, title="Buying Absorbed", style=shape.circle, location=location.abovebar, color=buyAbsColor, size=size.tiny, text="A")
+
+// ---------- Range-weighted Volume Profile ----------
+bool profileEnabled = profileMode != "Off"
+bool profileActive = profileMode == "Daily" or (profileMode == "Session" and inSession)
+bool profileReset = profileMode == "Daily" ? newDay : profileMode == "Session" ? sessionStart : false
+bool commitProfileBar = profileActive and intrabarCount > 0 and (barstate.isconfirmed or showDevelopingProfile)
+var array<float> pHighs = array.new_float()
+var array<float> pLows = array.new_float()
+var array<float> pVolumes = array.new_float()
+var float pLow = na
+var float pHigh = na
+var int lastCommittedBarIndex = na
+if profileReset
+    array.clear(pHighs)
+    array.clear(pLows)
+    array.clear(pVolumes)
+    pLow := na
+    pHigh := na
+    lastCommittedBarIndex := na
+bool canCommitThisExecution = commitProfileBar and (barstate.isconfirmed or na(lastCommittedBarIndex) or lastCommittedBarIndex != bar_index)
+if profileEnabled and canCommitThisExecution
+    for i = 0 to intrabarCount - 1
+        float ih = array.get(ltfHigh, i)
+        float il = array.get(ltfLow, i)
+        float iv = nz(array.get(ltfVolume, i))
+        if iv > 0
+            array.push(pHighs, ih)
+            array.push(pLows, il)
+            array.push(pVolumes, iv)
+            pLow := na(pLow) ? il : math.min(pLow, il)
+            pHigh := na(pHigh) ? ih : math.max(pHigh, ih)
+    lastCommittedBarIndex := bar_index
+    while array.size(pVolumes) > profileMaxIntrabars
+        array.shift(pHighs)
+        array.shift(pLows)
+        array.shift(pVolumes)
+
+var array<box> pBoxes = array.new_box()
+var line pocLine = na
+var line vahLine = na
+var line valLine = na
+var float profilePoc = na
+var float profileVah = na
+var float profileVal = na
+if barstate.islast
+    while array.size(pBoxes) > 0
+        box.delete(array.pop(pBoxes))
+    if not na(pocLine)
+        line.delete(pocLine)
+    if not na(vahLine)
+        line.delete(vahLine)
+    if not na(valLine)
+        line.delete(valLine)
+    pocLine := na
+    vahLine := na
+    valLine := na
+    profilePoc := na
+    profileVah := na
+    profileVal := na
+    int n = array.size(pVolumes)
+    float fullRange = na(pHigh) or na(pLow) ? na : pHigh - pLow
+    if profileEnabled and n > 0 and not na(fullRange) and fullRange > syminfo.mintick
+        array<float> rows = array.new_float(profileRows, 0.0)
+        float rowSize = fullRange / profileRows
+        float totalV = 0.0
+        for i = 0 to n - 1
+            float ih = array.get(pHighs, i)
+            float il = array.get(pLows, i)
+            float iv = array.get(pVolumes, i)
+            float intrabarRange = math.max(ih - il, syminfo.mintick)
+            int startRow = int(math.floor((il - pLow) / rowSize))
+            int endRow = int(math.floor((ih - pLow) / rowSize))
+            startRow := math.max(0, math.min(profileRows - 1, startRow))
+            endRow := math.max(0, math.min(profileRows - 1, endRow))
+            if endRow >= startRow
+                for r = startRow to endRow
+                    float rowLo = pLow + r * rowSize
+                    float rowHi = rowLo + rowSize
+                    float overlap = math.max(0.0, math.min(ih, rowHi) - math.max(il, rowLo))
+                    float allocated = overlap > 0 ? iv * overlap / intrabarRange : 0.0
+                    if allocated > 0
+                        array.set(rows, r, array.get(rows, r) + allocated)
+                        totalV += allocated
+        if totalV > 0
+            int pocIdx = 0
+            float maxV = array.get(rows, 0)
+            for r = 1 to profileRows - 1
+                float rv = array.get(rows, r)
+                if rv > maxV
+                    maxV := rv
+                    pocIdx := r
+            int lo = pocIdx
+            int hi = pocIdx
+            float vaV = maxV
+            float targetV = totalV * valueAreaPct / 100.0
+            while vaV < targetV and (lo > 0 or hi < profileRows - 1)
+                float lv = lo > 0 ? array.get(rows, lo - 1) : -1.0
+                float hv = hi < profileRows - 1 ? array.get(rows, hi + 1) : -1.0
+                if hv >= lv and hi < profileRows - 1
+                    hi += 1
+                    vaV += hv
+                else if lo > 0
+                    lo -= 1
+                    vaV += lv
+            profilePoc := pLow + (pocIdx + 0.5) * rowSize
+            profileVal := pLow + lo * rowSize
+            profileVah := pLow + (hi + 1) * rowSize
+            pocLine := line.new(bar_index - 1, profilePoc, bar_index + 1, profilePoc, extend=extend.both, color=color.fuchsia, width=2)
+            vahLine := line.new(bar_index - 1, profileVah, bar_index + 1, profileVah, extend=extend.both, color=color.new(color.gray, 30), style=line.style_dashed)
+            valLine := line.new(bar_index - 1, profileVal, bar_index + 1, profileVal, extend=extend.both, color=color.new(color.gray, 30), style=line.style_dashed)
+            if profileDisplay == "Full Profile" and maxV > 0
+                for r = 0 to profileRows - 1
+                    float rv = array.get(rows, r)
+                    int w = int(math.round(profileWidthBars * rv / maxV))
+                    if w > 0
+                        float y1 = pLow + r * rowSize
+                        float y2 = y1 + rowSize
+                        bool inValueArea = r >= lo and r <= hi
+                        color fillColor = r == pocIdx ? color.new(color.fuchsia, 72) : inValueArea ? color.new(color.blue, 78) : color.new(color.gray, 88)
+                        array.push(pBoxes, box.new(bar_index - w, y2, bar_index, y1, bgcolor=fillColor, border_color=color.new(fillColor, 20)))
+
+// ---------- HUD ----------
+var table hud = table.new(position.top_right, 2, 17, border_width=0)
+if barstate.islast and showDiagnostics
+    table.cell(hud, 0, 0, "AuctionAI Order Flow")
+    table.cell(hud, 1, 0, "RC5 Universal")
+    table.cell(hud, 0, 1, "Bar Status")
+    table.cell(hud, 1, 1, barStatus, text_color=barStatus == "LIVE / PARTIAL" ? color.orange : color.green)
+    table.cell(hud, 0, 2, "Delta Source")
+    table.cell(hud, 1, 2, "Weighted Intrabar Estimate")
+    table.cell(hud, 0, 3, "Lower TF / Intrabars")
+    table.cell(hud, 1, 3, lowerTf + " / " + str.tostring(intrabarCount))
+    table.cell(hud, 0, 4, "Delta %")
+    table.cell(hud, 1, 4, na(deltaPercent) ? "N/A" : str.tostring(deltaPercent, "#.0") + "%")
+    table.cell(hud, 0, 5, "Delta Coverage")
+    table.cell(hud, 1, 5, na(deltaCoverage) ? "N/A" : str.tostring(deltaCoverage * 100.0, "#.0") + "% " + (deltaReliable ? "OK" : "LOW"))
+    table.cell(hud, 0, 6, "CVD Bias")
+    table.cell(hud, 1, 6, cvdBias)
+    table.cell(hud, 0, 7, "Rel Volume")
+    table.cell(hud, 1, 7, na(relativeVolume) ? "N/A" : str.tostring(relativeVolume, "#.00") + "x " + volumeState)
+    table.cell(hud, 0, 8, "Daily Volume")
+    table.cell(hud, 1, 8, showPeriodVolumeStats ? str.tostring(dailyVolume, "#.0") + (na(dailyVsPrevPct) ? "" : " / " + str.tostring(dailyVsPrevPct, "#.0") + "% prev") : "OFF")
+    table.cell(hud, 0, 9, "Session Volume")
+    table.cell(hud, 1, 9, showPeriodVolumeStats ? str.tostring(sessionVolume, "#.0") + (na(sessionVsPrevPct) ? "" : " / " + str.tostring(sessionVsPrevPct, "#.0") + "% prev") : "OFF")
+    table.cell(hud, 0, 10, "Effort / Result")
+    table.cell(hud, 1, 10, effortResultState)
+    table.cell(hud, 0, 11, "Absorption")
+    table.cell(hud, 1, 11, absorptionState)
+    table.cell(hud, 0, 12, "Candle State")
+    table.cell(hud, 1, 12, candleState)
+    table.cell(hud, 0, 13, "Profile")
+    table.cell(hud, 1, 13, profileMode + (profileMode == "Session" ? " / " + sessionPreset : ""))
+    table.cell(hud, 0, 14, "Profile TZ")
+    table.cell(hud, 1, 14, profileMode == "Session" ? presetTimezone : syminfo.timezone)
+    table.cell(hud, 0, 15, "POC / VAH / VAL")
+    table.cell(hud, 1, 15, na(profilePoc) ? "N/A" : str.tostring(profilePoc, format.mintick) + " / " + str.tostring(profileVah, format.mintick) + " / " + str.tostring(profileVal, format.mintick))
+    table.cell(hud, 0, 16, "Session")
+    table.cell(hud, 1, 16, sessionPreset + (inSession ? " ACTIVE" : " CLOSED"))
+
+plot(delta, "Delta", display=display.data_window)
+plot(deltaPercent, "Delta %", display=display.data_window)
+plot(deltaCoverage, "Delta Coverage", display=display.data_window)
+plot(cvd, "CVD", display=display.data_window)
+plot(relativeVolume, "Relative Volume", display=display.data_window)
+plot(dailyVolume, "Daily Volume", display=display.data_window)
+plot(sessionVolume, "Session Volume", display=display.data_window)
+plot(profilePoc, "Profile POC", display=display.data_window)
+plot(profileVah, "Profile VAH", display=display.data_window)
+plot(profileVal, "Profile VAL", display=display.data_window)
