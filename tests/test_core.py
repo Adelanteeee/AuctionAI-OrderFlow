@@ -89,3 +89,11 @@ def test_load_csv_warns_when_duplicate_timestamps_are_deduplicated(tmp_path):
     assert len(out)==1
     assert out.iloc[0].close==2.0
     assert any('duplicate timestamp' in str(w.message).lower() for w in caught)
+
+
+def test_outcome_same_bar_both_thresholds_stays_neutral():
+    future = pd.DataFrame([{'high':101.2,'low':98.8,'close':100.0},{'high':103.0,'low':99.5,'close':102.0}])
+    out=evaluate_event(entry_close=100,atr=2,direction='bullish',future=future,threshold_atr=.5)
+    assert out['label']=='NEUTRAL'
+    assert math.isclose(out['mfe_atr'],1.5)
+    assert math.isclose(out['mae_atr'],0.6)
