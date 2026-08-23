@@ -159,8 +159,11 @@ def run_backtest(one_minute: pd.DataFrame, cfg: BacktestConfig, symbol='DATASET'
     records=[]
     for k,e in enumerate(sorted(events,key=lambda x:x['timestamp']),1):
         ts=e['timestamp']; pos=bars.index.get_loc(ts)
-        row=bars.iloc[pos]; future=bars.iloc[pos+1:pos+1+cfg.outcome_horizon]
-        out=evaluate_event(entry_close=row.close,atr=row.atr,direction=e['direction'],future=future,threshold_atr=cfg.outcome_threshold_atr)
+        row=bars.iloc[pos]
+        outcome_start=ts+pd.Timedelta(cfg.parent_timeframe)
+        outcome_end=outcome_start+pd.Timedelta(cfg.parent_timeframe)*cfg.outcome_horizon
+        future_intrabar=one_minute[(one_minute.index>=outcome_start)&(one_minute.index<outcome_end)]
+        out=evaluate_event(entry_close=row.close,atr=row.atr,direction=e['direction'],future=future_intrabar,threshold_atr=cfg.outcome_threshold_atr)
         rec={'event_id':f'E{k:06d}','timestamp':ts,'symbol':symbol,'parent_timeframe':cfg.parent_timeframe,'event_type':e['event_type'],'direction':e['direction'],'close':row.close,'atr':row.atr,'delta':row.delta,'delta_pct':row.delta_pct,'cvd':row.cvd,'cvd_bias':row.cvd_bias,'relative_volume':row.relative_volume,'daily_volume':row.daily_volume,'daily_volume_pace':row.daily_volume_pace,'session_volume':row.session_volume,'session_volume_pace':row.session_volume_pace,'volume_pace_state':row.volume_pace_state,'reference_type':cfg.auction_reference,'ref_poc':row.ref_poc,'ref_vah':row.ref_vah,'ref_val':row.ref_val,'dev_poc':row.dev_poc,'dev_vah':row.dev_vah,'dev_val':row.dev_val,'auction_state':row.auction_state,'value_migration':row.value_migration,'poc_migration':row.poc_migration,'absorption_score':row.absorption_score,'absorption_state':row.absorption_state,'pivot_timestamp':e.get('pivot_timestamp')}
         for h in (1,3,5):
             if pos+h < len(bars):
