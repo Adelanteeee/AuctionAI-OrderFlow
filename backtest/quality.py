@@ -41,3 +41,11 @@ def quality_grade(score: int) -> str:
     if score >= 60:
         return "B"
     return "C"
+
+
+def should_show_event(event_type: str, grade: str, show_only_a: bool = True) -> bool:
+    """RC9.3.1 visual filter: default A/A+, and divergences never label below A."""
+    high_grade = grade in {"A", "A+"}
+    if event_type in {"STRONG_BEAR_DIVERGENCE", "STRONG_BULL_DIVERGENCE"}:
+        return high_grade
+    return high_grade if show_only_a else True
