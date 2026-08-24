@@ -1,0 +1,366 @@
+//@version=6
+indicator("AuctionAI Order Flow v1 — RC9.3.1 Quality Research", overlay=true, max_labels_count=500)
+
+string G_DELTA="Delta", G_VOLUME="Volume", G_AUCTION="Auction Context", G_DIV="Divergence", G_ABS="Absorption", G_QUALITY="Quality Research", G_DISPLAY="Display"
+
+lowerTf=input.timeframe("1","Lower Timeframe",group=G_DELTA)
+deltaBodyWeight=input.float(.65,"Body Direction Weight",minval=0,maxval=1,step=.05,group=G_DELTA)
+deltaCloseWeight=input.float(.35,"Close Location Weight",minval=0,maxval=1,step=.05,group=G_DELTA)
+deltaPressureCap=input.float(.90,"Intrabar Pressure Cap",minval=.50,maxval=1,step=.05,group=G_DELTA)
+cvdSmoothLen=input.int(5,"CVD Smoothing",minval=1,group=G_DELTA)
+
+paceExpand=input.float(115.0,"Pace Expanding >= %",minval=100,step=5,group=G_VOLUME)
+paceContract=input.float(85.0,"Pace Contracting <= %",minval=0,maxval=100,step=5,group=G_VOLUME)
+
+profileRows=input.int(28,"Previous Day Profile Rows",minval=8,maxval=60,group=G_AUCTION)
+valueAreaPct=input.float(70.0,"Value Area %",minval=50,maxval=99,step=1,group=G_AUCTION)
+acceptanceCloses=input.int(2,"Acceptance Closes",minval=2,maxval=4,group=G_AUCTION)
+rejectionMinPenetrationAtr=input.float(.03,"Rejection Min Penetration / ATR",minval=0,maxval=.50,step=.01,group=G_AUCTION)
+structureSwingLeft=input.int(3,"Structure Swing Left",minval=1,maxval=10,group=G_AUCTION)
+structureSwingRight=input.int(3,"Structure Swing Right",minval=1,maxval=10,group=G_AUCTION)
+structureProximityAtr=input.float(.25,"Swing Proximity / ATR",minval=.05,maxval=1.0,step=.05,group=G_AUCTION)
+
+pivotLeft=input.int(3,"Pivot Left",minval=1,group=G_DIV)
+pivotRight=input.int(3,"Pivot Right",minval=1,group=G_DIV)
+
+absDeltaPct=input.float(20.0,"Min |Delta %|",minval=0,step=1,group=G_ABS)
+highVolMult=input.float(1.5,"High Volume Multiplier",minval=1,step=.1,group=G_ABS)
+resultThreshold=input.float(.5,"High Result / ATR",minval=.05,step=.05,group=G_ABS)
+
+showQualityLabels=input.bool(true,"Show Quality Labels",group=G_QUALITY)
+showOnlyA=input.bool(true,"Show Only A / A+",group=G_QUALITY)
+showReferenceLines=input.bool(true,"Show Previous Day VAH / VAL / POC",group=G_DISPLAY)
+showHud=input.bool(true,"Show Quality HUD",group=G_DISPLAY)
+
+bool confirmedSignalBar=barstate.isconfirmed
+bool newDay=timeframe.change("D")
+float atr=ta.atr(14)
+
+[ltfOpen,ltfHigh,ltfLow,ltfClose,ltfVolume]=request.security_lower_tf(syminfo.tickerid,lowerTf,[open,high,low,close,volume])
+int intrabarCount=array.size(ltfVolume)
+float buyVolume=0.0
+float sellVolume=0.0
+float classifiedVolume=0.0
+float weightSum=math.max(deltaBodyWeight+deltaCloseWeight,.0001)
+if intrabarCount>0
+    for i=0 to intrabarCount-1
+        float o=array.get(ltfOpen,i)
+        float h=array.get(ltfHigh,i)
+        float l=array.get(ltfLow,i)
+        float c=array.get(ltfClose,i)
+        float v=nz(array.get(ltfVolume,i))
+        float r=math.max(h-l,syminfo.mintick)
+        float bodyBias=math.max(-1.0,math.min(1.0,(c-o)/r))
+        float closeBias=math.max(-1.0,math.min(1.0,((c-l)/r)*2.0-1.0))
+        float pressureRaw=(bodyBias*deltaBodyWeight+closeBias*deltaCloseWeight)/weightSum
+        float pressure=math.max(-deltaPressureCap,math.min(deltaPressureCap,pressureRaw))
+        float buyShare=.5+.5*pressure
+        buyVolume+=v*buyShare
+        sellVolume+=v*(1.0-buyShare)
+        classifiedVolume+=v
+float delta=classifiedVolume>0?buyVolume-sellVolume:na
+float deltaPercent=classifiedVolume>0?delta/classifiedVolume*100.0:na
+var float cvd=0.0
+cvd+=nz(delta)
+float cvdSmooth=ta.ema(cvd,cvdSmoothLen)
+float cvdSlope=cvdSmooth-cvdSmooth[1]
+string cvdBias=cvdSlope>0?"RISING":cvdSlope<0?"FALLING":"FLAT"
+
+var float dailyVolume=0.0
+var array<float> currentDayCurve=array.new_float(1440,na)
+var array<float> previousDayCurve=array.new_float(1440,na)
+int dayMinuteKey=hour(time,syminfo.timezone)*60+minute(time,syminfo.timezone)
+if newDay
+    previousDayCurve:=array.copy(currentDayCurve)
+    currentDayCurve:=array.new_float(1440,na)
+    dailyVolume:=volume
+else
+    dailyVolume+=volume
+array.set(currentDayCurve,dayMinuteKey,dailyVolume)
+float previousDayAtSameTime=array.get(previousDayCurve,dayMinuteKey)
+float dailyVolumePace=not na(previousDayAtSameTime) and previousDayAtSameTime>0?dailyVolume/previousDayAtSameTime*100.0:na
+string volumePaceState=na(dailyVolumePace)?"N/A":dailyVolumePace>=paceExpand?"EXPANDING":dailyVolumePace<=paceContract?"CONTRACTING":"NORMAL"
+
+f_profile_levels(array<float> highs,array<float> lows,array<float> vols,int rowsCount,float vaPct)=>
+    float outPoc=na
+    float outVah=na
+    float outVal=na
+    int n=array.size(vols)
+    if n>0
+        float pLo=array.min(lows)
+        float pHi=array.max(highs)
+        float fullRange=pHi-pLo
+        if fullRange>syminfo.mintick
+            array<float> rows=array.new_float(rowsCount,0.0)
+            float rowSize=fullRange/rowsCount
+            float totalV=0.0
+            for i=0 to n-1
+                float ih=array.get(highs,i)
+                float il=array.get(lows,i)
+                float iv=array.get(vols,i)
+                float intrabarRange=math.max(ih-il,syminfo.mintick)
+                int startRow=int(math.floor((il-pLo)/rowSize))
+                int endRow=int(math.floor((ih-pLo)/rowSize))
+                startRow:=math.max(0,math.min(rowsCount-1,startRow))
+                endRow:=math.max(0,math.min(rowsCount-1,endRow))
+                for r=startRow to endRow
+                    float rowLo=pLo+r*rowSize
+                    float rowHi=rowLo+rowSize
+                    float overlap=math.max(0.0,math.min(ih,rowHi)-math.max(il,rowLo))
+                    float allocated=overlap>0?iv*overlap/intrabarRange:0.0
+                    if allocated>0
+                        array.set(rows,r,array.get(rows,r)+allocated)
+                        totalV+=allocated
+            if totalV>0
+                int pocIdx=0
+                float maxV=array.get(rows,0)
+                for r=1 to rowsCount-1
+                    float rv=array.get(rows,r)
+                    if rv>maxV
+                        maxV:=rv
+                        pocIdx:=r
+                int lo=pocIdx
+                int hi=pocIdx
+                float vaV=maxV
+                float targetV=totalV*vaPct/100.0
+                while vaV<targetV and (lo>0 or hi<rowsCount-1)
+                    float lv=lo>0?array.get(rows,lo-1):-1.0
+                    float hv=hi<rowsCount-1?array.get(rows,hi+1):-1.0
+                    if hv>=lv and hi<rowsCount-1
+                        hi+=1
+                        vaV+=hv
+                    else if lo>0
+                        lo-=1
+                        vaV+=lv
+                outPoc:=pLo+(pocIdx+.5)*rowSize
+                outVal:=pLo+lo*rowSize
+                outVah:=pLo+(hi+1)*rowSize
+    [outPoc,outVah,outVal]
+
+var array<float> dayHighs=array.new_float()
+var array<float> dayLows=array.new_float()
+var array<float> dayVols=array.new_float()
+var float prevDayPoc=na
+var float prevDayVah=na
+var float prevDayVal=na
+if newDay
+    [pdPoc,pdVah,pdVal]=f_profile_levels(dayHighs,dayLows,dayVols,profileRows,valueAreaPct)
+    prevDayPoc:=pdPoc
+    prevDayVah:=pdVah
+    prevDayVal:=pdVal
+    array.clear(dayHighs)
+    array.clear(dayLows)
+    array.clear(dayVols)
+if confirmedSignalBar and intrabarCount>0
+    for i=0 to intrabarCount-1
+        float iv=nz(array.get(ltfVolume,i))
+        if iv>0
+            array.push(dayHighs,array.get(ltfHigh,i))
+            array.push(dayLows,array.get(ltfLow,i))
+            array.push(dayVols,iv)
+
+bool hasReference=not na(prevDayPoc) and not na(prevDayVah) and not na(prevDayVal)
+float rejectionPenetration=atr*rejectionMinPenetrationAtr
+var int aboveAcceptCount=0
+var int belowAcceptCount=0
+if newDay
+    aboveAcceptCount:=0
+    belowAcceptCount:=0
+if confirmedSignalBar and hasReference
+    aboveAcceptCount:=close>prevDayVah?aboveAcceptCount+1:0
+    belowAcceptCount:=close<prevDayVal?belowAcceptCount+1:0
+bool acceptedAbove=hasReference and aboveAcceptCount>=acceptanceCloses
+bool acceptedBelow=hasReference and belowAcceptCount>=acceptanceCloses
+bool rejectedAbove=hasReference and confirmedSignalBar and ((high>prevDayVah+rejectionPenetration and close<=prevDayVah) or (close[1]>prevDayVah and close<=prevDayVah))
+bool rejectedBelow=hasReference and confirmedSignalBar and ((low<prevDayVal-rejectionPenetration and close>=prevDayVal) or (close[1]<prevDayVal and close>=prevDayVal))
+
+float structureHighPivot=ta.pivothigh(high,structureSwingLeft,structureSwingRight)
+float structureLowPivot=ta.pivotlow(low,structureSwingLeft,structureSwingRight)
+var float lastStructureHigh=na
+var float lastStructureLow=na
+if not na(structureHighPivot)
+    lastStructureHigh:=structureHighPivot
+if not na(structureLowPivot)
+    lastStructureLow:=structureLowPivot
+float structureTolerance=atr*structureProximityAtr
+bool nearSwingHigh=not na(lastStructureHigh) and ((low<=lastStructureHigh and high>=lastStructureHigh) or math.abs(high-lastStructureHigh)<=structureTolerance)
+bool nearSwingLow=not na(lastStructureLow) and ((low<=lastStructureLow and high>=lastStructureLow) or math.abs(low-lastStructureLow)<=structureTolerance)
+
+var bool acceptedAboveLatched=false
+var bool acceptedBelowLatched=false
+var bool rejectedAboveLatched=false
+var bool rejectedBelowLatched=false
+if newDay
+    acceptedAboveLatched:=false
+    acceptedBelowLatched:=false
+    rejectedAboveLatched:=false
+    rejectedBelowLatched:=false
+if confirmedSignalBar and hasReference
+    if not acceptedAbove
+        acceptedAboveLatched:=false
+    if not acceptedBelow
+        acceptedBelowLatched:=false
+    if close>prevDayVah
+        rejectedAboveLatched:=false
+    if close<prevDayVal
+        rejectedBelowLatched:=false
+bool acceptedAboveEvent=confirmedSignalBar and acceptedAbove and not acceptedAboveLatched
+bool acceptedBelowEvent=confirmedSignalBar and acceptedBelow and not acceptedBelowLatched
+bool rejectedAboveEvent=confirmedSignalBar and rejectedAbove and nearSwingHigh and not rejectedAboveLatched
+bool rejectedBelowEvent=confirmedSignalBar and rejectedBelow and nearSwingLow and not rejectedBelowLatched
+if acceptedAboveEvent
+    acceptedAboveLatched:=true
+if acceptedBelowEvent
+    acceptedBelowLatched:=true
+if rejectedAboveEvent
+    rejectedAboveLatched:=true
+if rejectedBelowEvent
+    rejectedBelowLatched:=true
+
+float lowPivot=ta.pivotlow(low,pivotLeft,pivotRight)
+float highPivot=ta.pivothigh(high,pivotLeft,pivotRight)
+bool newLowPivot=not na(lowPivot)
+bool newHighPivot=not na(highPivot)
+var float prevLowPrice=na
+var float prevLowDelta=na
+var float prevLowCvd=na
+var float prevHighPrice=na
+var float prevHighDelta=na
+var float prevHighCvd=na
+float currLowPrice=newLowPivot?low[pivotRight]:na
+float currLowDelta=newLowPivot?delta[pivotRight]:na
+float currLowCvd=newLowPivot?cvd[pivotRight]:na
+float currHighPrice=newHighPivot?high[pivotRight]:na
+float currHighDelta=newHighPivot?delta[pivotRight]:na
+float currHighCvd=newHighPivot?cvd[pivotRight]:na
+bool strongBullDiv=newLowPivot and not na(prevLowPrice) and not na(currLowDelta) and not na(prevLowDelta) and not na(currLowCvd) and not na(prevLowCvd) and currLowPrice<prevLowPrice and currLowDelta>prevLowDelta and currLowCvd>prevLowCvd
+bool strongBearDiv=newHighPivot and not na(prevHighPrice) and not na(currHighDelta) and not na(prevHighDelta) and not na(currHighCvd) and not na(prevHighCvd) and currHighPrice>prevHighPrice and currHighDelta<prevHighDelta and currHighCvd<prevHighCvd
+if newLowPivot
+    prevLowPrice:=currLowPrice
+    prevLowDelta:=currLowDelta
+    prevLowCvd:=currLowCvd
+if newHighPivot
+    prevHighPrice:=currHighPrice
+    prevHighDelta:=currHighDelta
+    prevHighCvd:=currHighCvd
+
+float volumeAvg=ta.sma(volume,20)
+float relativeVolume=volumeAvg>0?volume/volumeAvg:na
+float barRange=math.max(high-low,syminfo.mintick)
+float upperWickRatio=(high-math.max(open,close))/barRange
+float lowerWickRatio=(math.min(open,close)-low)/barRange
+float closeLocation=(close-low)/barRange
+float resultMagnitude=math.abs(close-close[1])
+bool highResult=atr>0 and resultMagnitude>=atr*resultThreshold
+float deltaStrength=not na(deltaPercent)?math.min(1.0,math.abs(deltaPercent)/math.max(absDeltaPct,1.0)):0.0
+float effortStrength=not na(relativeVolume)?math.min(1.0,relativeVolume/math.max(highVolMult,.01)):0.0
+float lowResultStrength=highResult?0.0:1.0
+float sellRejectStrength=math.min(1.0,(lowerWickRatio+closeLocation)/1.2)
+float buyRejectStrength=math.min(1.0,(upperWickRatio+(1.0-closeLocation))/1.2)
+float sellingAbsScore=not na(deltaPercent) and deltaPercent<=-absDeltaPct?(deltaStrength*30+effortStrength*25+lowResultStrength*20+sellRejectStrength*25):0.0
+float buyingAbsScore=not na(deltaPercent) and deltaPercent>=absDeltaPct?(deltaStrength*30+effortStrength*25+lowResultStrength*20+buyRejectStrength*25):0.0
+bool strongSellingAbsorption=confirmedSignalBar and sellingAbsScore>=75 and nearSwingLow
+bool strongBuyingAbsorption=confirmedSignalBar and buyingAbsScore>=75 and nearSwingHigh
+var bool sellAbsLatched=false
+var bool buyAbsLatched=false
+bool sellingAbsEvent=strongSellingAbsorption and not sellAbsLatched
+bool buyingAbsEvent=strongBuyingAbsorption and not buyAbsLatched
+sellAbsLatched:=strongSellingAbsorption
+buyAbsLatched:=strongBuyingAbsorption
+
+f_quality_score(string eventType,string paceState,string cvdState)=>
+    float score=eventType=="ACC_ABOVE_VAH"?60:eventType=="ACC_BELOW_VAL"?60:eventType=="REJ_ABOVE_VAH"?45:eventType=="REJ_BELOW_VAL"?45:eventType=="STRONG_BEAR_DIVERGENCE"?60:eventType=="STRONG_BULL_DIVERGENCE"?45:eventType=="STRONG_BUYING_ABSORPTION"?70:eventType=="STRONG_SELLING_ABSORPTION"?60:0
+    if eventType=="ACC_ABOVE_VAH"
+        score+=paceState=="EXPANDING"?30:paceState=="CONTRACTING"?15:0
+    else if eventType=="ACC_BELOW_VAL"
+        score+=paceState=="CONTRACTING"?20:paceState=="EXPANDING"?10:0
+    else if eventType=="STRONG_BEAR_DIVERGENCE"
+        score+=paceState=="CONTRACTING"?20:0
+        score+=cvdState=="FALLING"?10:0
+    math.max(0,math.min(100,score))
+
+f_grade(float score)=>score>=85?"A+":score>=75?"A":score>=60?"B":"C"
+f_grade_color(string grade)=>grade=="A+"?color.lime:grade=="A"?color.green:grade=="B"?color.orange:color.gray
+f_show_event(string eventType,string grade)=>
+    bool highGrade=grade=="A+" or grade=="A"
+    bool isDivergence=eventType=="STRONG_BEAR_DIVERGENCE" or eventType=="STRONG_BULL_DIVERGENCE"
+    isDivergence?highGrade:(showOnlyA?highGrade:true)
+
+var string lastEvent="NONE"
+var float lastScore=na
+var string lastGrade="N/A"
+
+f_emit(bool eventCond,string eventType,string shortName,bool bullish)=>
+    float score=f_quality_score(eventType,volumePaceState,cvdBias)
+    string grade=f_grade(score)
+    if eventCond and showQualityLabels and f_show_event(eventType,grade)
+        label.new(bar_index,bullish?low:high,shortName+" "+grade+"\n"+str.tostring(score,"#.0"),style=bullish?label.style_label_up:label.style_label_down,textcolor=color.white,color=f_grade_color(grade),size=size.tiny)
+    [eventCond?eventType:"",eventCond?score:na,eventCond?grade:""]
+
+[e1,s1,g1]=f_emit(acceptedAboveEvent,"ACC_ABOVE_VAH","ACC↑",true)
+[e2,s2,g2]=f_emit(acceptedBelowEvent,"ACC_BELOW_VAL","ACC↓",false)
+[e3,s3,g3]=f_emit(rejectedAboveEvent,"REJ_ABOVE_VAH","REJ↓",false)
+[e4,s4,g4]=f_emit(rejectedBelowEvent,"REJ_BELOW_VAL","REJ↑",true)
+[e5,s5,g5]=f_emit(strongBearDiv and confirmedSignalBar,"STRONG_BEAR_DIVERGENCE","DIV↓",false)
+[e6,s6,g6]=f_emit(strongBullDiv and confirmedSignalBar,"STRONG_BULL_DIVERGENCE","DIV↑",true)
+[e7,s7,g7]=f_emit(buyingAbsEvent,"STRONG_BUYING_ABSORPTION","ABS↓",false)
+[e8,s8,g8]=f_emit(sellingAbsEvent,"STRONG_SELLING_ABSORPTION","ABS↑",true)
+
+if e1!=""
+    lastEvent:=e1
+    lastScore:=s1
+    lastGrade:=g1
+if e2!=""
+    lastEvent:=e2
+    lastScore:=s2
+    lastGrade:=g2
+if e3!=""
+    lastEvent:=e3
+    lastScore:=s3
+    lastGrade:=g3
+if e4!=""
+    lastEvent:=e4
+    lastScore:=s4
+    lastGrade:=g4
+if e5!=""
+    lastEvent:=e5
+    lastScore:=s5
+    lastGrade:=g5
+if e6!=""
+    lastEvent:=e6
+    lastScore:=s6
+    lastGrade:=g6
+if e7!=""
+    lastEvent:=e7
+    lastScore:=s7
+    lastGrade:=g7
+if e8!=""
+    lastEvent:=e8
+    lastScore:=s8
+    lastGrade:=g8
+
+plot(showReferenceLines?prevDayPoc:na,"Previous Day POC",color=color.fuchsia,linewidth=2)
+plot(showReferenceLines?prevDayVah:na,"Previous Day VAH",color=color.new(color.green,35),style=plot.style_linebr)
+plot(showReferenceLines?prevDayVal:na,"Previous Day VAL",color=color.new(color.red,35),style=plot.style_linebr)
+
+var table hud=table.new(position.top_right,2,8,border_width=0)
+if barstate.islast and showHud
+    table.clear(hud,0,0,1,7)
+    table.cell(hud,0,0,"AuctionAI Quality")
+    table.cell(hud,1,0,"RC9.3.1 Research")
+    table.cell(hud,0,1,"Last Event")
+    table.cell(hud,1,1,lastEvent)
+    table.cell(hud,0,2,"Event Quality")
+    table.cell(hud,1,2,na(lastScore)?"N/A":str.tostring(lastScore,"#.0")+" /100 | "+lastGrade,text_color=lastGrade=="A+"?color.lime:lastGrade=="A"?color.green:lastGrade=="B"?color.orange:color.gray)
+    table.cell(hud,0,3,"Visible Grades")
+    table.cell(hud,1,3,showOnlyA?"A / A+ only":"All except DIV B/C")
+    table.cell(hud,0,4,"Volume Pace")
+    table.cell(hud,1,4,volumePaceState+(na(dailyVolumePace)?"":" | "+str.tostring(dailyVolumePace,"#.0")+"%"))
+    table.cell(hud,0,5,"CVD Bias")
+    table.cell(hud,1,5,cvdBias)
+    table.cell(hud,0,6,"Reference")
+    table.cell(hud,1,6,"Previous Day")
+    table.cell(hud,0,7,"Meaning")
+    table.cell(hud,1,7,"Research rank — not win probability")
+
+plot(lastScore,"Last Event Quality Score",display=display.data_window)
