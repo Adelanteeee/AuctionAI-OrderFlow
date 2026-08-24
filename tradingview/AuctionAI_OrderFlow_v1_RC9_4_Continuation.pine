@@ -1,0 +1,217 @@
+//@version=6
+indicator("AuctionAI Order Flow v1 — RC9.4 Continuation Research", overlay=true, max_labels_count=500)
+
+string G_STRUCT="Trend Structure", G_FLOW="Order Flow", G_CONT="Continuation", G_DISPLAY="Display"
+
+swingLeft=input.int(3,"Swing Left",minval=1,maxval=10,group=G_STRUCT)
+swingRight=input.int(3,"Swing Right",minval=1,maxval=10,group=G_STRUCT)
+locationAtr=input.float(.60,"Structure Proximity / ATR",minval=.10,maxval=2.0,step=.05,group=G_STRUCT)
+
+lowerTf=input.timeframe("1","Lower Timeframe",group=G_FLOW)
+deltaBodyWeight=input.float(.65,"Body Direction Weight",minval=0,maxval=1,step=.05,group=G_FLOW)
+deltaCloseWeight=input.float(.35,"Close Location Weight",minval=0,maxval=1,step=.05,group=G_FLOW)
+deltaPressureCap=input.float(.90,"Intrabar Pressure Cap",minval=.50,maxval=1,step=.05,group=G_FLOW)
+cvdSmoothLen=input.int(5,"CVD Smoothing",minval=1,group=G_FLOW)
+highVolMult=input.float(1.5,"High Volume Multiplier",minval=1,step=.1,group=G_FLOW)
+absDeltaPct=input.float(20.0,"Min |Delta %|",minval=0,step=1,group=G_FLOW)
+
+watchMinScore=input.int(60,"Watch Score >=",minval=40,maxval=100,group=G_CONT)
+confirmMinScore=input.int(75,"Confirmed Failure Score >=",minval=50,maxval=100,group=G_CONT)
+watchBars=input.int(4,"Confirmation Window Bars",minval=1,maxval=10,group=G_CONT)
+showWatch=input.bool(true,"Show Trend Continuation Watch",group=G_CONT)
+showConfirmed=input.bool(true,"Show Pullback Failure",group=G_CONT)
+
+showSwings=input.bool(false,"Show Last Swing Levels",group=G_DISPLAY)
+showHud=input.bool(true,"Show HUD",group=G_DISPLAY)
+
+bool confirmed=barstate.isconfirmed
+float atr=ta.atr(14)
+
+[lo,lh,ll,lc,lv]=request.security_lower_tf(syminfo.tickerid,lowerTf,[open,high,low,close,volume])
+int n=array.size(lv)
+float buyVol=0.0
+float sellVol=0.0
+float classifiedVol=0.0
+float wsum=math.max(deltaBodyWeight+deltaCloseWeight,.0001)
+if n>0
+    for i=0 to n-1
+        float o=array.get(lo,i)
+        float h=array.get(lh,i)
+        float l=array.get(ll,i)
+        float c=array.get(lc,i)
+        float v=nz(array.get(lv,i))
+        float r=math.max(h-l,syminfo.mintick)
+        float bodyBias=math.max(-1.0,math.min(1.0,(c-o)/r))
+        float closeBias=math.max(-1.0,math.min(1.0,((c-l)/r)*2.0-1.0))
+        float pressure=(bodyBias*deltaBodyWeight+closeBias*deltaCloseWeight)/wsum
+        pressure:=math.max(-deltaPressureCap,math.min(deltaPressureCap,pressure))
+        float buyShare=.5+.5*pressure
+        buyVol+=v*buyShare
+        sellVol+=v*(1.0-buyShare)
+        classifiedVol+=v
+float delta=classifiedVol>0?buyVol-sellVol:na
+float deltaPct=classifiedVol>0?delta/classifiedVol*100.0:na
+var float cvd=0.0
+cvd+=nz(delta)
+float cvdSmooth=ta.ema(cvd,cvdSmoothLen)
+float cvdSlope=cvdSmooth-cvdSmooth[1]
+string cvdBias=cvdSlope>0?"RISING":cvdSlope<0?"FALLING":"FLAT"
+
+float volAvg=ta.sma(volume,20)
+float relVol=volAvg>0?volume/volAvg:na
+bool highEffort=not na(relVol) and relVol>=highVolMult
+float barRange=math.max(high-low,syminfo.mintick)
+float resultAbs=math.abs(close-close[1])
+bool highResult=atr>0 and resultAbs>=atr*.5
+bool highEffortLowResult=highEffort and not highResult
+float upperWick=(high-math.max(open,close))/barRange
+float lowerWick=(math.min(open,close)-low)/barRange
+float closeLoc=(close-low)/barRange
+float dStrength=not na(deltaPct)?math.min(1.0,math.abs(deltaPct)/math.max(absDeltaPct,1.0)):0.0
+float eStrength=not na(relVol)?math.min(1.0,relVol/math.max(highVolMult,.01)):0.0
+float lowResultStrength=highResult?0.0:1.0
+float buyRejectStrength=math.min(1.0,(upperWick+(1.0-closeLoc))/1.2)
+float sellRejectStrength=math.min(1.0,(lowerWick+closeLoc)/1.2)
+float buyingAbsScore=not na(deltaPct) and deltaPct>=absDeltaPct?dStrength*30+eStrength*25+lowResultStrength*20+buyRejectStrength*25:0.0
+float sellingAbsScore=not na(deltaPct) and deltaPct<=-absDeltaPct?dStrength*30+eStrength*25+lowResultStrength*20+sellRejectStrength*25:0.0
+bool buyingAbsorption=buyingAbsScore>=75
+bool sellingAbsorption=sellingAbsScore>=75
+
+float ph=ta.pivothigh(high,swingLeft,swingRight)
+float pl=ta.pivotlow(low,swingLeft,swingRight)
+var float prevHigh=na
+var float lastHigh=na
+var float prevLow=na
+var float lastLow=na
+if not na(ph)
+    prevHigh:=lastHigh
+    lastHigh:=ph
+if not na(pl)
+    prevLow:=lastLow
+    lastLow:=pl
+
+bool bearishStructure=not na(prevHigh) and not na(lastHigh) and not na(prevLow) and not na(lastLow) and lastHigh<prevHigh and lastLow<prevLow
+bool bullishStructure=not na(prevHigh) and not na(lastHigh) and not na(prevLow) and not na(lastLow) and lastHigh>prevHigh and lastLow>prevLow
+string trendState=bearishStructure?"BEARISH":bullishStructure?"BULLISH":"NEUTRAL"
+
+float tol=atr*locationAtr
+bool nearLastHigh=not na(lastHigh) and math.abs(high-lastHigh)<=tol
+bool nearLastLow=not na(lastLow) and math.abs(low-lastLow)<=tol
+
+bool bullishPullback=close>close[1] or high>high[1]
+bool bearishPullback=close<close[1] or low<low[1]
+bool bearLocation=bearishStructure and nearLastHigh
+bool bullLocation=bullishStructure and nearLastLow
+
+bool bearCvdDisagreement=bearishStructure and bullishPullback and cvdBias=="RISING" and close<=nz(lastHigh,close)
+bool bullCvdDisagreement=bullishStructure and bearishPullback and cvdBias=="FALLING" and close>=nz(lastLow,close)
+
+f_score(bool trendOk,bool locationOk,bool absorption,bool helr,bool cvdDis,bool conf)=>
+    float s=trendOk?25.0:0.0
+    if trendOk and locationOk
+        s+=20
+    if trendOk and absorption
+        s+=20
+    if trendOk and helr
+        s+=15
+    if trendOk and cvdDis
+        s+=10
+    if trendOk and conf
+        s+=10
+    math.min(100,s)
+
+f_grade(float s)=>s>=90?"A+":s>=75?"A":s>=60?"B":"C"
+
+float bearWatchScore=f_score(bearishStructure,bearLocation,buyingAbsorption,highEffortLowResult,bearCvdDisagreement,false)
+float bullWatchScore=f_score(bullishStructure,bullLocation,sellingAbsorption,highEffortLowResult,bullCvdDisagreement,false)
+
+bool bearWatchRaw=confirmed and bullishPullback and bearWatchScore>=watchMinScore
+bool bullWatchRaw=confirmed and bearishPullback and bullWatchScore>=watchMinScore
+
+var int bearWatchAge=1000
+var int bullWatchAge=1000
+var float bearTriggerLow=na
+var float bullTriggerHigh=na
+var bool bearWatchLatched=false
+var bool bullWatchLatched=false
+
+if bearWatchRaw and not bearWatchLatched
+    bearWatchAge:=0
+    bearTriggerLow:=low
+    bearWatchLatched:=true
+if bullWatchRaw and not bullWatchLatched
+    bullWatchAge:=0
+    bullTriggerHigh:=high
+    bullWatchLatched:=true
+
+if bearWatchLatched
+    bearWatchAge+=1
+if bullWatchLatched
+    bullWatchAge+=1
+
+bool bearConfirm=confirmed and bearWatchLatched and bearWatchAge<=watchBars+1 and close<low[1] and close<open
+bool bullConfirm=confirmed and bullWatchLatched and bullWatchAge<=watchBars+1 and close>high[1] and close>open
+float bearConfirmScore=f_score(bearishStructure,bearLocation,buyingAbsorption or buyingAbsorption[1],highEffortLowResult or highEffortLowResult[1],bearCvdDisagreement or bearCvdDisagreement[1],bearConfirm)
+float bullConfirmScore=f_score(bullishStructure,bullLocation,sellingAbsorption or sellingAbsorption[1],highEffortLowResult or highEffortLowResult[1],bullCvdDisagreement or bullCvdDisagreement[1],bullConfirm)
+bool bearFailure=bearConfirm and bearConfirmScore>=confirmMinScore
+bool bullFailure=bullConfirm and bullConfirmScore>=confirmMinScore
+
+if bearFailure or bearWatchAge>watchBars+1 or not bearishStructure
+    bearWatchLatched:=false
+    bearWatchAge:=1000
+if bullFailure or bullWatchAge>watchBars+1 or not bullishStructure
+    bullWatchLatched:=false
+    bullWatchAge:=1000
+
+var bool bearWatchMarkerLatched=false
+var bool bullWatchMarkerLatched=false
+if not bearWatchRaw
+    bearWatchMarkerLatched:=false
+if not bullWatchRaw
+    bullWatchMarkerLatched:=false
+bool bearWatchEvent=bearWatchRaw and not bearWatchMarkerLatched
+bool bullWatchEvent=bullWatchRaw and not bullWatchMarkerLatched
+if bearWatchEvent
+    bearWatchMarkerLatched:=true
+if bullWatchEvent
+    bullWatchMarkerLatched:=true
+
+if showWatch and bearWatchEvent
+    label.new(bar_index,high,"WATCH ↓\n"+f_grade(bearWatchScore)+" "+str.tostring(bearWatchScore,"#.0"),style=label.style_label_down,color=color.orange,textcolor=color.white,size=size.tiny)
+if showWatch and bullWatchEvent
+    label.new(bar_index,low,"WATCH ↑\n"+f_grade(bullWatchScore)+" "+str.tostring(bullWatchScore,"#.0"),style=label.style_label_up,color=color.aqua,textcolor=color.black,size=size.tiny)
+if showConfirmed and bearFailure
+    label.new(bar_index,high,"PULLBACK FAIL ↓\n"+f_grade(bearConfirmScore)+" "+str.tostring(bearConfirmScore,"#.0"),style=label.style_label_down,color=color.red,textcolor=color.white,size=size.small)
+if showConfirmed and bullFailure
+    label.new(bar_index,low,"PULLBACK FAIL ↑\n"+f_grade(bullConfirmScore)+" "+str.tostring(bullConfirmScore,"#.0"),style=label.style_label_up,color=color.green,textcolor=color.white,size=size.small)
+
+alertcondition(bearWatchEvent,"Bearish Trend Continuation Watch","AuctionAI RC9.4: bearish trend continuation watch")
+alertcondition(bullWatchEvent,"Bullish Trend Continuation Watch","AuctionAI RC9.4: bullish trend continuation watch")
+alertcondition(bearFailure,"Bearish Pullback Failure","AuctionAI RC9.4: bearish pullback failure confirmed")
+alertcondition(bullFailure,"Bullish Pullback Failure","AuctionAI RC9.4: bullish pullback failure confirmed")
+
+plot(showSwings?lastHigh:na,"Last Swing High",color=color.new(color.red,50),style=plot.style_linebr)
+plot(showSwings?lastLow:na,"Last Swing Low",color=color.new(color.green,50),style=plot.style_linebr)
+
+var table hud=table.new(position.top_right,2,8,border_width=0)
+if barstate.islast and showHud
+    table.clear(hud,0,0,1,7)
+    table.cell(hud,0,0,"AuctionAI Continuation")
+    table.cell(hud,1,0,"RC9.4 Research")
+    table.cell(hud,0,1,"Trend")
+    table.cell(hud,1,1,trendState,text_color=bearishStructure?color.red:bullishStructure?color.green:color.gray)
+    table.cell(hud,0,2,"Bear Watch")
+    table.cell(hud,1,2,str.tostring(bearWatchScore,"#.0")+" | "+f_grade(bearWatchScore))
+    table.cell(hud,0,3,"Bull Watch")
+    table.cell(hud,1,3,str.tostring(bullWatchScore,"#.0")+" | "+f_grade(bullWatchScore))
+    table.cell(hud,0,4,"CVD Bias")
+    table.cell(hud,1,4,cvdBias)
+    table.cell(hud,0,5,"Rel Volume")
+    table.cell(hud,1,5,na(relVol)?"N/A":str.tostring(relVol,"#.00")+"x")
+    table.cell(hud,0,6,"Buying / Selling Abs")
+    table.cell(hud,1,6,str.tostring(buyingAbsScore,"#.0")+" / "+str.tostring(sellingAbsScore,"#.0"))
+    table.cell(hud,0,7,"Meaning")
+    table.cell(hud,1,7,"Watch ≠ entry; failure needs confirmation")
+
+plot(bearWatchScore,"Bear Continuation Score",display=display.data_window)
+plot(bullWatchScore,"Bull Continuation Score",display=display.data_window)
